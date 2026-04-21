@@ -3,6 +3,7 @@ src = "src"
 out = "out"
 libs = ["lib"]
 solc_version = "0.8.33"
+# ffi = true  # required — forge-safe uses vm.ffi for HTTP calls via curl
 
 [fmt]
 line_length = 90
