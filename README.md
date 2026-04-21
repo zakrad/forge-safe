@@ -31,17 +31,14 @@ remappings = [
 
 ## Usage
 
-### Propose a transaction
+### Propose a transaction (private key)
 
 ```solidity
 import {SafeTxServiceProposer} from "forge-safe/SafeTxServiceProposer.sol";
 
 contract MyProposalScript is Script {
-    using SafeTxServiceProposer for *;
-
     function run() external {
         address safe = 0xYourSafeAddress;
-        uint256 signerKey = vm.envUint("SAFE_OWNER_CI_PRIVATE_KEY");
         string memory apiKey = vm.envString("SAFE_TRANSACTION_SERVICE_API_KEY");
 
         address[] memory tos = new address[](2);
@@ -67,7 +64,7 @@ contract MyProposalScript is Script {
                 txServiceUrl: txServiceUrl,
                 safe: safe,
                 safeTx: safeTx,
-                signerKey: signerKey,
+                signer: SafeTxServiceProposer.keySigner(vm.envUint("SAFE_OWNER_CI_PRIVATE_KEY")),
                 apiKey: apiKey,
                 origin: "my-deploy-script"
             })
@@ -82,16 +79,41 @@ contract MyProposalScript is Script {
 }
 ```
 
-### Add a second confirmation
+### Propose with a Ledger hardware wallet
 
-If your script has access to a second signer key (e.g. a CI key that is also a Safe owner), you can confirm the tx in the same script run:
+Replace the `signer` field — everything else stays the same:
 
 ```solidity
-bool alreadyConfirmed = SafeTxServiceProposer.confirm(
+// First Ledger account (BIP-44 index 0)
+signer: SafeTxServiceProposer.ledgerSigner()
+
+// Or a specific account index
+signer: SafeTxServiceProposer.ledgerSigner(2)
+```
+
+Ledger firmware does not allow raw hash signing. The library signs via `personal_sign` (what Ledger supports) and sets `v += 4` in the resulting signature. Safe's `checkSignatures` has a dedicated `v > 30` branch that handles this path correctly — it prepends the EIP-191 prefix before `ecrecover`, recovering the correct signer address.
+
+### Add a second confirmation
+
+If your script has access to a second signer (e.g. a CI key that is also a Safe owner), confirm in the same run:
+
+```solidity
+// With a private key
+SafeTxServiceProposer.confirm(
     SafeTxServiceProposer.ConfirmArgs({
         txServiceUrl: txServiceUrl,
         safeTxHash: result.safeTxHash,
-        signerKey: secondSignerKey,
+        signer: SafeTxServiceProposer.keySigner(secondKey),
+        apiKey: apiKey
+    })
+);
+
+// Or with a Ledger
+SafeTxServiceProposer.confirm(
+    SafeTxServiceProposer.ConfirmArgs({
+        txServiceUrl: txServiceUrl,
+        safeTxHash: result.safeTxHash,
+        signer: SafeTxServiceProposer.ledgerSigner(),
         apiKey: apiKey
     })
 );

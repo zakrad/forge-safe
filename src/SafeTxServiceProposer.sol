@@ -17,6 +17,35 @@ library SafeTxServiceProposer {
     error UnsupportedSafeTxServiceChain(uint256 chainId);
     error SafeTxServiceRequestFailed(uint256 status, string body);
 
+    // -------------------------------------------------------------------------
+    // Signer
+    // -------------------------------------------------------------------------
+
+    /// @notice Describes how the script signs Safe transactions.
+    /// For key-based signing set `privateKey`.
+    /// For Ledger set `ledger = true`; `hdPathIndex` selects the BIP-44 account (0 = first).
+    struct Signer {
+        uint256 privateKey;
+        bool    ledger;
+        uint32  hdPathIndex;
+    }
+
+    function keySigner(uint256 privateKey) internal pure returns (Signer memory) {
+        return Signer({privateKey: privateKey, ledger: false, hdPathIndex: 0});
+    }
+
+    function ledgerSigner() internal pure returns (Signer memory) {
+        return Signer({privateKey: 0, ledger: true, hdPathIndex: 0});
+    }
+
+    function ledgerSigner(uint32 hdPathIndex) internal pure returns (Signer memory) {
+        return Signer({privateKey: 0, ledger: true, hdPathIndex: hdPathIndex});
+    }
+
+    // -------------------------------------------------------------------------
+    // Core structs
+    // -------------------------------------------------------------------------
+
     struct SafeTransactionData {
         address to;
         uint256 value;
@@ -42,7 +71,7 @@ library SafeTxServiceProposer {
         string txServiceUrl;
         address safe;
         SafeTransactionData safeTx;
-        uint256 signerKey;
+        Signer signer;
         string apiKey;
         string origin;
     }
@@ -50,9 +79,13 @@ library SafeTxServiceProposer {
     struct ConfirmArgs {
         string txServiceUrl;
         bytes32 safeTxHash;
-        uint256 signerKey;
+        Signer signer;
         string apiKey;
     }
+
+    // -------------------------------------------------------------------------
+    // Chain registry
+    // -------------------------------------------------------------------------
 
     // solhint-disable-next-line code-complexity
     function defaultTxServiceUrl(uint256 chainId) internal pure returns (string memory) {
@@ -108,6 +141,10 @@ library SafeTxServiceProposer {
         revert UnsupportedSafeTxServiceChain(chainId);
     }
 
+    // -------------------------------------------------------------------------
+    // Transaction building
+    // -------------------------------------------------------------------------
+
     function buildTransaction(
         address[] memory tos,
         uint256[] memory values,
@@ -143,11 +180,15 @@ library SafeTxServiceProposer {
         safeTx.operation = OP_DELEGATE_CALL;
     }
 
+    // -------------------------------------------------------------------------
+    // Propose
+    // -------------------------------------------------------------------------
+
     function propose(ProposeArgs memory args)
         internal
         returns (ProposalResult memory result)
     {
-        result.sender = vm.addr(args.signerKey);
+        result.sender = _resolveAddress(args.signer);
         result.safeTxHash = _safeTransactionHash(args.safe, args.safeTx);
         result.nonce = args.safeTx.nonce;
         result.txServiceUrl = args.txServiceUrl;
@@ -164,7 +205,7 @@ library SafeTxServiceProposer {
             revert SafeTxServiceRequestFailed(getStatus, string(getBody));
         }
 
-        bytes memory signature = _signHash(args.signerKey, result.safeTxHash);
+        bytes memory signature = _sign(args.signer, result.safeTxHash);
         string memory payload = _proposalPayload(
             args.safeTx, result.safeTxHash, result.sender, signature, args.origin
         );
@@ -178,10 +219,14 @@ library SafeTxServiceProposer {
         result.alreadyProposed = false;
     }
 
-    /// @notice Add a confirmation (signature) from signerKey to an already-proposed tx.
+    // -------------------------------------------------------------------------
+    // Confirm
+    // -------------------------------------------------------------------------
+
+    /// @notice Add a confirmation (signature) from signer to an already-proposed tx.
     /// @dev Returns true if the confirmation was already present (idempotent).
     function confirm(ConfirmArgs memory args) internal returns (bool alreadyConfirmed) {
-        bytes memory signature = _signHash(args.signerKey, args.safeTxHash);
+        bytes memory signature = _sign(args.signer, args.safeTxHash);
         string memory payload = string.concat('{"signature":"', vm.toString(signature), '"}');
 
         string memory url = string.concat(
@@ -204,7 +249,11 @@ library SafeTxServiceProposer {
         }
     }
 
-    /// @notice Fetch the next nonce to use from the tx service (accounts for queued pending txs).
+    // -------------------------------------------------------------------------
+    // Nonce
+    // -------------------------------------------------------------------------
+
+    /// @notice Fetch the next nonce from the tx service (accounts for queued pending txs).
     /// @dev Use this instead of ISafe(safe).nonce() when other txs may already be queued.
     function getNonceFromService(string memory txServiceUrl, address safe)
         internal
@@ -216,6 +265,55 @@ library SafeTxServiceProposer {
         if (status != 200) revert SafeTxServiceRequestFailed(status, string(body));
         return vm.parseJsonUint(string(body), ".nonce");
     }
+
+    // -------------------------------------------------------------------------
+    // Signing internals
+    // -------------------------------------------------------------------------
+
+    function _resolveAddress(Signer memory signer) private returns (address) {
+        if (!signer.ledger) return vm.addr(signer.privateKey);
+        string[] memory inputs = new string[](3);
+        inputs[0] = "bash";
+        inputs[1] = "-c";
+        inputs[2] = string.concat(
+            'cast abi-encode "f(address)" $(cast wallet address --ledger --mnemonic-index ',
+            vm.toString(uint256(signer.hdPathIndex)),
+            ")"
+        );
+        bytes memory res = vm.ffi(inputs);
+        return abi.decode(res, (address));
+    }
+
+    /// @dev Ledger firmware blocks raw hash signing, so we use personal_sign instead.
+    ///      Safe's checkSignatures accepts eth_sign (personal_sign) when v > 30 — it
+    ///      prepends the EIP-191 prefix before ecrecover, recovering the correct signer.
+    ///      We set v += 4 (27→31 or 28→32) to signal this path to the Safe contract.
+    function _sign(Signer memory signer, bytes32 hash) private returns (bytes memory) {
+        if (!signer.ledger) {
+            (uint8 v, bytes32 r, bytes32 s) = vm.sign(signer.privateKey, hash);
+            return abi.encodePacked(r, s, v);
+        }
+
+        string[] memory inputs = new string[](3);
+        inputs[0] = "bash";
+        inputs[1] = "-c";
+        inputs[2] = string.concat(
+            'cast abi-encode "f(bytes)" $(cast wallet sign --ledger --mnemonic-index ',
+            vm.toString(uint256(signer.hdPathIndex)),
+            " ",
+            vm.toString(hash),
+            ")"
+        );
+        bytes memory res = vm.ffi(inputs);
+        bytes memory sig = abi.decode(res, (bytes));
+        require(sig.length == 65, "unexpected Ledger signature length");
+        sig[64] = bytes1(uint8(sig[64]) + 4);
+        return sig;
+    }
+
+    // -------------------------------------------------------------------------
+    // HTTP internals
+    // -------------------------------------------------------------------------
 
     function _headers(string memory apiKey)
         private
@@ -288,6 +386,10 @@ library SafeTxServiceProposer {
         return abi.decode(res, (uint256, bytes));
     }
 
+    // -------------------------------------------------------------------------
+    // Encoding internals
+    // -------------------------------------------------------------------------
+
     function _encodeMultiSend(
         address[] memory tos,
         uint256[] memory values,
@@ -345,14 +447,6 @@ library SafeTxServiceProposer {
                 safeTx.refundReceiver,
                 safeTx.nonce
             );
-    }
-
-    function _signHash(uint256 signerKey, bytes32 safeTxHash)
-        private
-        returns (bytes memory)
-    {
-        (uint8 v, bytes32 r, bytes32 s) = vm.sign(signerKey, safeTxHash);
-        return abi.encodePacked(r, s, v);
     }
 }
 
