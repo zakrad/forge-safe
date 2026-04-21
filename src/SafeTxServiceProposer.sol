@@ -47,8 +47,64 @@ library SafeTxServiceProposer {
         string origin;
     }
 
+    struct ConfirmArgs {
+        string txServiceUrl;
+        bytes32 safeTxHash;
+        uint256 signerKey;
+        string apiKey;
+    }
+
+    // solhint-disable-next-line code-complexity
     function defaultTxServiceUrl(uint256 chainId) internal pure returns (string memory) {
-        if (chainId == 84_532) return "https://api.safe.global/tx-service/basesep";
+        // Mainnets
+        if (chainId == 1)          return "https://api.safe.global/tx-service/eth";
+        if (chainId == 10)         return "https://api.safe.global/tx-service/oeth";
+        if (chainId == 50)         return "https://api.safe.global/tx-service/xdc";
+        if (chainId == 56)         return "https://api.safe.global/tx-service/bnb";
+        if (chainId == 100)        return "https://api.safe.global/tx-service/gno";
+        if (chainId == 130)        return "https://api.safe.global/tx-service/unichain";
+        if (chainId == 137)        return "https://api.safe.global/tx-service/pol";
+        if (chainId == 143)        return "https://api.safe.global/tx-service/monad";
+        if (chainId == 146)        return "https://api.safe.global/tx-service/sonic";
+        if (chainId == 196)        return "https://api.safe.global/tx-service/okb";
+        if (chainId == 204)        return "https://api.safe.global/tx-service/opbnb";
+        if (chainId == 232)        return "https://api.safe.global/tx-service/lens";
+        if (chainId == 324)        return "https://api.safe.global/tx-service/zksync";
+        if (chainId == 480)        return "https://api.safe.global/tx-service/wc";
+        if (chainId == 988)        return "https://api.safe.global/tx-service/stable";
+        if (chainId == 999)        return "https://api.safe.global/tx-service/hyper";
+        if (chainId == 1101)       return "https://api.safe.global/tx-service/zkevm";
+        if (chainId == 3338)       return "https://api.safe.global/tx-service/peaq";
+        if (chainId == 3637)       return "https://api.safe.global/tx-service/btc";
+        if (chainId == 4217)       return "https://api.safe.global/tx-service/tempo";
+        if (chainId == 4326)       return "https://api.safe.global/tx-service/mega";
+        if (chainId == 5000)       return "https://api.safe.global/tx-service/mantle";
+        if (chainId == 8453)       return "https://api.safe.global/tx-service/base";
+        if (chainId == 9745)       return "https://api.safe.global/tx-service/plasma";
+        if (chainId == 16661)      return "https://api.safe.global/tx-service/0g";
+        if (chainId == 25363)      return "https://api.5afe.dev/tx-service/fluent";
+        if (chainId == 42161)      return "https://api.safe.global/tx-service/arb1";
+        if (chainId == 42220)      return "https://api.safe.global/tx-service/celo";
+        if (chainId == 42431)      return "https://api.safe.global/tx-service/tempo-moderato";
+        if (chainId == 43111)      return "https://api.safe.global/tx-service/hemi";
+        if (chainId == 43114)      return "https://api.safe.global/tx-service/avax";
+        if (chainId == 57073)      return "https://api.safe.global/tx-service/ink";
+        if (chainId == 59144)      return "https://api.safe.global/tx-service/linea";
+        if (chainId == 80094)      return "https://api.safe.global/tx-service/berachain";
+        if (chainId == 81224)      return "https://api.safe.global/tx-service/codex";
+        if (chainId == 102030)     return "https://api.safe.global/tx-service/ctc";
+        if (chainId == 534352)     return "https://api.safe.global/tx-service/scr";
+        if (chainId == 747474)     return "https://api.safe.global/tx-service/katana";
+        if (chainId == 1313161554) return "https://api.safe.global/tx-service/aurora";
+        // Testnets
+        if (chainId == 5003)       return "https://api.safe.global/tx-service/mnt-sep";
+        if (chainId == 10143)      return "https://api.safe.global/tx-service/monad-testnet";
+        if (chainId == 10200)      return "https://api.safe.global/tx-service/chi";
+        if (chainId == 11155111)   return "https://api.safe.global/tx-service/sep";
+        if (chainId == 46630)      return "https://api.safe.global/tx-service/robinhood-testnet";
+        if (chainId == 80069)      return "https://api.safe.global/tx-service/bep";
+        if (chainId == 84532)      return "https://api.safe.global/tx-service/basesep";
+        if (chainId == 5042002)    return "https://api.safe.global/tx-service/arc-testnet";
         revert UnsupportedSafeTxServiceChain(chainId);
     }
 
@@ -120,6 +176,45 @@ library SafeTxServiceProposer {
         }
 
         result.alreadyProposed = false;
+    }
+
+    /// @notice Add a confirmation (signature) from signerKey to an already-proposed tx.
+    /// @dev Returns true if the confirmation was already present (idempotent).
+    function confirm(ConfirmArgs memory args) internal returns (bool alreadyConfirmed) {
+        bytes memory signature = _signHash(args.signerKey, args.safeTxHash);
+        string memory payload = string.concat('{"signature":"', vm.toString(signature), '"}');
+
+        string memory url = string.concat(
+            args.txServiceUrl,
+            "/api/v1/multisig-transactions/",
+            vm.toString(args.safeTxHash),
+            "/confirmations/"
+        );
+
+        (uint256 status, bytes memory body) =
+            _ffiRequest("POST", url, _headers(args.apiKey), payload);
+
+        // Safe API returns 400 when the signature is already submitted
+        if (status == 400) {
+            alreadyConfirmed = true;
+            return alreadyConfirmed;
+        }
+        if (status < 200 || status >= 300) {
+            revert SafeTxServiceRequestFailed(status, string(body));
+        }
+    }
+
+    /// @notice Fetch the next nonce to use from the tx service (accounts for queued pending txs).
+    /// @dev Use this instead of ISafe(safe).nonce() when other txs may already be queued.
+    function getNonceFromService(string memory txServiceUrl, address safe)
+        internal
+        returns (uint256)
+    {
+        string[] memory noHeaders = new string[](0);
+        string memory url = string.concat(txServiceUrl, "/api/v1/safes/", vm.toString(safe), "/");
+        (uint256 status, bytes memory body) = _ffiRequest("GET", url, noHeaders, "");
+        if (status != 200) revert SafeTxServiceRequestFailed(status, string(body));
+        return vm.parseJsonUint(string(body), ".nonce");
     }
 
     function _headers(string memory apiKey)
